@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
         rtlib
         GIT_REPOSITORY https://github.com/vladbelousoff/rtlib.git
-        GIT_TAG 433c78f93e14cd1def7975df16bf74c37896fefd
+        GIT_TAG 244de2714cbea5bf117e1afaaf675a2568113240
 )
 
 FetchContent_MakeAvailable(rtlib)
@@ -28,7 +28,7 @@ FetchContent_MakeAvailable(rtlib)
 FetchContent_Declare(
         lemon
         GIT_REPOSITORY https://github.com/vladbelousoff/lemon
-        GIT_TAG 76e06e6a449723c7a1fafa6a3bb13b4c8c3c0b6a
+        GIT_TAG c9aae223bb9ad4ffc991dd90717fa6a9393c732b
 )
 
 FetchContent_MakeAvailable(lemon)
@@ -81,12 +81,25 @@ target_include_directories(tea_parser PUBLIC
 
 target_link_libraries(tea_parser PUBLIC rtlib::rtlib)
 
-add_library(tea_lang
+set(TEA_HEADER_FILES
+        include/tea_lexer.h
+        include/tea_token.h
+        include/tea_ast.h
+        include/tea_parser.h
+        include/tea_interpret.h
+)
+
+set(TEA_SOURCE_FILES
         src/tea_lexer.c
         src/tea_token.c
         src/tea_ast.c
         src/tea_parser.c
         src/tea_interpret.c
+)
+
+add_library(tea_lang
+        ${TEA_HEADER_FILES}
+        ${TEA_SOURCE_FILES}
 )
 
 target_include_directories(tea_lang PUBLIC

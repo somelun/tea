@@ -27,28 +27,45 @@ void tea_interpret_init(tea_context_t* context)
   rtl_list_init(&context->variables);
 }
 
-static bool tea_interpret_execute_program(tea_context_t* context, const tea_ast_node_t* node)
+void tea_interpret_cleanup(const tea_context_t* context)
 {
   rtl_list_entry_t* entry;
-  rtl_list_for_each(entry, &node->children)
+  rtl_list_entry_t* safe;
+  rtl_list_for_each_safe(entry, safe, &context->variables)
   {
-    const tea_ast_node_t* child = rtl_list_record(entry, tea_ast_node_t, link);
-    if (!tea_interpret_execute(context, child)) {
-      return false;
+    tea_variable_t* variable = rtl_list_record(entry, tea_variable_t, link);
+    rtl_list_remove(entry);
+    if (variable->value.type == TEA_VALUE_STRING) {
+      rtl_free(variable->value.string_value);
     }
+    rtl_free(variable);
   }
-
-  return true;
 }
 
-static bool declare_variable(tea_context_t* context, const tea_token_t* name, const bool is_mutable,
-  const tea_ast_node_t* type, const tea_ast_node_t* initial_value)
+static bool tea_interpret_execute_stmt(tea_context_t* context, const tea_ast_node_t* node);
+
+static bool tea_interpret_execute_program(tea_context_t* context, const tea_ast_node_t* node)
+{
+  return tea_interpret_execute_stmt(context, node);
+}
+
+static tea_variable_t* tea_context_find_variable(const tea_context_t* context, const char* name);
+
+static bool tea_declare_variable(tea_context_t* context, const tea_token_t* name,
+  const bool is_mutable, const tea_ast_node_t* type, const tea_ast_node_t* initial_value)
 {
   if (!name) {
     return false;
   }
 
-  tea_variable_t* variable = rtl_malloc(sizeof(*variable));
+  tea_variable_t* variable = tea_context_find_variable(context, name->buffer);
+  if (variable) {
+    rtl_log_err("Variable %s is already declared (line: %d, col: %d)", name->buffer, name->line,
+      name->column);
+    return false;
+  }
+
+  variable = rtl_malloc(sizeof(*variable));
   if (!variable) {
     rtl_log_err("Failed to allocate memory for variable %.*s", name->buffer_size, name->buffer);
     return false;
@@ -60,13 +77,16 @@ static bool declare_variable(tea_context_t* context, const tea_token_t* name, co
 
   switch (variable->value.type) {
     case TEA_VALUE_I32:
-      rtl_log_dbg("Declare variable '%s' : %s = %d", name->buffer,
+      rtl_log_dbg("Declare variable %s : %s = %d", name->buffer,
         tea_value_get_type_string(variable->value.type), variable->value.i32_value);
       break;
     case TEA_VALUE_F32:
-      rtl_log_dbg("Declare variable '%s' : %s = %f", name->buffer,
+      rtl_log_dbg("Declare variable %s : %s = %f", name->buffer,
         tea_value_get_type_string(variable->value.type), variable->value.f32_value);
       break;
+    case TEA_VALUE_STRING:
+      rtl_log_dbg("Declare variable %s : %s = '%s'", name->buffer,
+        tea_value_get_type_string(variable->value.type), variable->value.string_value);
     default:
       break;
   }
@@ -100,7 +120,109 @@ static bool tea_interpret_execute_let(tea_context_t* context, const tea_ast_node
     }
   }
 
-  return declare_variable(context, name, is_mutable, type, expr);
+  return tea_declare_variable(context, name, is_mutable, type, expr);
+}
+
+static bool tea_interpret_execute_assign(tea_context_t* context, const tea_ast_node_t* node)
+{
+  const tea_token_t* name = node->token;
+  if (!name) {
+    exit(1);
+  }
+
+  tea_variable_t* variable = tea_context_find_variable(context, name->buffer);
+  if (!variable) {
+    rtl_log_err("Cannot find variable '%s'", name->buffer);
+    exit(1);
+  }
+
+  if (!variable->is_mutable) {
+    rtl_log_err("Variable '%s' is not mutable, so cannot be modified", name->buffer);
+    exit(1);
+  }
+
+  // First child is the value on the right
+  const tea_ast_node_t* rhs =
+    rtl_list_record(rtl_list_first(&node->children), tea_ast_node_t, link);
+  const tea_value_t new_value = tea_interpret_evaluate_expression(context, rhs);
+
+  if (new_value.type == variable->value.type) {
+    variable->value = new_value;
+  } else {
+    rtl_log_err(
+      "Cannot assign variable '%s', because the original type is %s, but the new type is %s",
+      name->buffer, tea_value_get_type_string(variable->value.type),
+      tea_value_get_type_string(new_value.type));
+    exit(1);
+  }
+
+  switch (variable->value.type) {
+    case TEA_VALUE_I32:
+      rtl_log_dbg("New value for variable %s : %s = %d", name->buffer,
+        tea_value_get_type_string(variable->value.type), variable->value.i32_value);
+      break;
+    case TEA_VALUE_F32:
+      rtl_log_dbg("New value for variable %s : %s = %f", name->buffer,
+        tea_value_get_type_string(variable->value.type), variable->value.f32_value);
+      break;
+    case TEA_VALUE_STRING:
+      rtl_log_dbg("New value for variable %s : %s = '%s'", name->buffer,
+        tea_value_get_type_string(variable->value.type), variable->value.string_value);
+      break;
+    case TEA_VALUE_OBJECT:
+      break;
+  }
+
+  return true;
+}
+
+static bool tea_interpret_execute_if(tea_context_t* context, const tea_ast_node_t* node)
+{
+  const tea_ast_node_t* condition = NULL;
+  const tea_ast_node_t* then_node = NULL;
+  const tea_ast_node_t* else_node = NULL;
+
+  rtl_list_entry_t* entry;
+  rtl_list_for_each(entry, &node->children)
+  {
+    const tea_ast_node_t* child = rtl_list_record(entry, tea_ast_node_t, link);
+    switch (child->type) {
+      case TEA_AST_NODE_THEN:
+        then_node = child;
+        break;
+      case TEA_AST_NODE_ELSE:
+        else_node = child;
+        break;
+      default:
+        condition = child;
+        break;
+    }
+  }
+
+  const tea_value_t if_expr = tea_interpret_evaluate_expression(context, condition);
+  if (if_expr.i32_value != 0) {
+    return tea_interpret_execute(context, then_node);
+  }
+
+  if (else_node) {
+    return tea_interpret_execute(context, else_node);
+  }
+
+  return true;
+}
+
+static bool tea_interpret_execute_stmt(tea_context_t* context, const tea_ast_node_t* node)
+{
+  rtl_list_entry_t* entry;
+  rtl_list_for_each(entry, &node->children)
+  {
+    const tea_ast_node_t* child = rtl_list_record(entry, tea_ast_node_t, link);
+    if (!tea_interpret_execute(context, child)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool tea_interpret_execute(tea_context_t* context, const tea_ast_node_t* node)
@@ -110,9 +232,22 @@ bool tea_interpret_execute(tea_context_t* context, const tea_ast_node_t* node)
       return tea_interpret_execute_program(context, node);
     case TEA_AST_NODE_LET:
       return tea_interpret_execute_let(context, node);
-    default:
+    case TEA_AST_NODE_ASSIGN:
+      return tea_interpret_execute_assign(context, node);
+    case TEA_AST_NODE_IF:
+      return tea_interpret_execute_if(context, node);
+    case TEA_AST_NODE_STMT:
+    case TEA_AST_NODE_THEN:
+    case TEA_AST_NODE_ELSE:
+      return tea_interpret_execute_stmt(context, node);
+    default: {
       rtl_log_err("Not implemented: %s", tea_ast_node_get_type_name(node->type));
-      break;
+      const tea_token_t* token = node->token;
+      if (token) {
+        rtl_log_err("Token: <%s> %.*s (line: %d, column: %d)", tea_get_token_name(token->type),
+          token->buffer_size, token->buffer, token->line, token->column);
+      }
+    } break;
   }
 
   return false;
@@ -162,21 +297,53 @@ static tea_value_t tea_interpret_evaluate_number(tea_token_t* token)
         }                                                                                          \
         result = a / b;                                                                            \
         break;                                                                                     \
+      case TEA_TOKEN_EQ:                                                                           \
+        result = a == b;                                                                           \
+        break;                                                                                     \
+      case TEA_TOKEN_NE:                                                                           \
+        result = a != b;                                                                           \
+        break;                                                                                     \
+      case TEA_TOKEN_GT:                                                                           \
+        result = a > b;                                                                            \
+        break;                                                                                     \
+      case TEA_TOKEN_GE:                                                                           \
+        result = a >= b;                                                                           \
+        break;                                                                                     \
+      case TEA_TOKEN_LT:                                                                           \
+        result = a < b;                                                                            \
+        break;                                                                                     \
+      case TEA_TOKEN_LE:                                                                           \
+        result = a <= b;                                                                           \
+        break;                                                                                     \
     }                                                                                              \
   } while (0)
 
 static tea_value_t tea_value_binop(
   const tea_value_t lhs_val, const tea_value_t rhs_val, const tea_token_t* op)
 {
+  tea_value_t result;
+
+  // By-default it's i32 for boolean ops
+  result.type = TEA_VALUE_I32;
+
+  switch (op->type) {
+    case TEA_TOKEN_OR:
+      result.i32_value = lhs_val.i32_value || rhs_val.i32_value;
+      return result;
+    case TEA_TOKEN_AND:
+      result.i32_value = lhs_val.i32_value && rhs_val.i32_value;
+      return result;
+    default:
+      break;
+  }
+
   if (lhs_val.type == TEA_VALUE_I32) {
     if (rhs_val.type == TEA_VALUE_I32) {
-      tea_value_t result = { 0 };
       result.type = TEA_VALUE_I32;
       TEA_APPLY_BINOP(lhs_val.i32_value, rhs_val.i32_value, op->type, result.i32_value);
       return result;
     }
     if (rhs_val.type == TEA_VALUE_F32) {
-      tea_value_t result = { 0 };
       result.type = TEA_VALUE_F32;
       TEA_APPLY_BINOP(lhs_val.i32_value, rhs_val.f32_value, op->type, result.f32_value);
       return result;
@@ -185,13 +352,11 @@ static tea_value_t tea_value_binop(
 
   if (lhs_val.type == TEA_VALUE_F32) {
     if (rhs_val.type == TEA_VALUE_I32) {
-      tea_value_t result = { 0 };
       result.type = TEA_VALUE_F32;
       TEA_APPLY_BINOP(lhs_val.f32_value, rhs_val.i32_value, op->type, result.f32_value);
       return result;
     }
     if (rhs_val.type == TEA_VALUE_F32) {
-      tea_value_t result = { 0 };
       result.type = TEA_VALUE_F32;
       TEA_APPLY_BINOP(lhs_val.f32_value, rhs_val.f32_value, op->type, result.f32_value);
       return result;
@@ -244,6 +409,58 @@ static tea_value_t tea_interpret_evaluate_unary(tea_context_t* context, const te
   return operand_val;
 }
 
+static tea_variable_t* tea_context_find_variable(const tea_context_t* context, const char* name)
+{
+  rtl_list_entry_t* entry;
+  rtl_list_for_each(entry, &context->variables)
+  {
+    tea_variable_t* variable = rtl_list_record(entry, tea_variable_t, link);
+    const tea_token_t* variable_name = variable->name;
+    if (!variable_name) {
+      continue;
+    }
+    if (!strcmp(variable_name->buffer, name)) {
+      return variable;
+    }
+  }
+
+  return NULL;
+}
+
+static tea_value_t tea_interpret_evaluate_ident(
+  const tea_context_t* context, const tea_ast_node_t* node)
+{
+  const tea_token_t* token = node->token;
+  if (!token) {
+    rtl_log_err("Impossible to evaluate ident token");
+    exit(1);
+  }
+
+  const tea_variable_t* variable = tea_context_find_variable(context, token->buffer);
+  if (!variable) {
+    rtl_log_err("Can't find variable %s", token->buffer);
+    exit(1);
+  }
+
+  return variable->value;
+}
+
+static tea_value_t tea_interpret_evaluate_string(
+  const tea_context_t* context, const tea_ast_node_t* node)
+{
+  const tea_token_t* token = node->token;
+  if (!token) {
+    rtl_log_err("Impossible to evaluate string token");
+    exit(1);
+  }
+
+  tea_value_t result;
+  result.type = TEA_VALUE_STRING;
+  result.string_value = rtl_strdup(&token->buffer[0]);
+
+  return result;
+}
+
 tea_value_t tea_interpret_evaluate_expression(tea_context_t* context, const tea_ast_node_t* node)
 {
   if (!node) {
@@ -258,9 +475,18 @@ tea_value_t tea_interpret_evaluate_expression(tea_context_t* context, const tea_
       return tea_interpret_evaluate_binop(context, node);
     case TEA_AST_NODE_UNARY:
       return tea_interpret_evaluate_unary(context, node);
-    default:
-      rtl_log_err("Impossible to evaluate node %s!", tea_ast_node_get_type_name(node->type));
-      break;
+    case TEA_AST_NODE_IDENT:
+      return tea_interpret_evaluate_ident(context, node);
+    case TEA_AST_NODE_STRING:
+      return tea_interpret_evaluate_string(context, node);
+    default: {
+      rtl_log_err("Failed to evaluate node <%s>", tea_ast_node_get_type_name(node->type));
+      tea_token_t* token = node->token;
+      if (token) {
+        rtl_log_err("Token: <%s> %.*s (line: %d, column: %d)", tea_get_token_name(token->type),
+          token->buffer_size, token->buffer, token->line, token->column);
+      }
+    } break;
   }
 
   exit(1);
